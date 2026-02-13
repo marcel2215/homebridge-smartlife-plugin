@@ -31,26 +31,10 @@ function sanitizeHomeKitName(name: string): string {
 type ReachabilityReason = ReturnType<SmartLifePlatform['getDeviceReachabilityReason']>;
 const BLOCKED_OPERATION_LOG_INTERVAL_MS = 30000;
 
-function parseDurationSeconds(value: unknown): number {
-  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
-    return Math.floor(value);
-  }
-
-  if (typeof value === 'string' && value.trim().length > 0) {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed) && parsed >= 0) {
-      return Math.floor(parsed);
-    }
-  }
-
-  return 0;
-}
-
 export class SmartLifePlatformAccessory {
   private service: Service;
   private lastReachabilityReason?: ReachabilityReason;
   private lastBlockedOperationLogAtMs = 0;
-  private valveSetDurationSeconds = 0;
 
   constructor(
     private readonly platform: SmartLifePlatform,
@@ -91,13 +75,9 @@ export class SmartLifePlatformAccessory {
     }
     case 'valve': {
       const current = parseSwitchState(this.dpValue(this.mapping.switchDpId));
-      const countdown = this.valveDurationSeconds();
-      this.valveSetDurationSeconds = countdown;
       this.service.updateCharacteristic(this.platform.Characteristic.Active,
         current ? this.platform.Characteristic.Active.ACTIVE : this.platform.Characteristic.Active.INACTIVE);
       this.service.updateCharacteristic(this.platform.Characteristic.InUse, current ? 1 : 0);
-      this.service.updateCharacteristic(this.platform.Characteristic.SetDuration, countdown);
-      this.service.updateCharacteristic(this.platform.Characteristic.RemainingDuration, current ? countdown : 0);
       break;
     }
     case 'contact': {
@@ -209,8 +189,6 @@ export class SmartLifePlatformAccessory {
 
     if (this.mapping.kind === 'valve') {
       this.service.setCharacteristic(this.platform.Characteristic.ValveType, this.platform.Characteristic.ValveType.GENERIC_VALVE);
-      this.service.setCharacteristic(this.platform.Characteristic.SetDuration, this.valveDurationSeconds());
-      this.service.setCharacteristic(this.platform.Characteristic.RemainingDuration, this.valveRemainingSeconds());
 
       this.service.getCharacteristic(this.platform.Characteristic.Active)
         .onGet(async () => {
@@ -224,16 +202,6 @@ export class SmartLifePlatformAccessory {
 
       this.service.getCharacteristic(this.platform.Characteristic.InUse)
         .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)) ? 1 : 0);
-
-      this.service.getCharacteristic(this.platform.Characteristic.SetDuration)
-        .onGet(async () => this.valveDurationSeconds())
-        .onSet(async (value) => {
-          this.valveSetDurationSeconds = parseDurationSeconds(value);
-          this.refresh();
-        });
-
-      this.service.getCharacteristic(this.platform.Characteristic.RemainingDuration)
-        .onGet(async () => this.valveRemainingSeconds());
     }
 
     if (this.mapping.kind === 'contact') {
@@ -344,24 +312,6 @@ export class SmartLifePlatformAccessory {
 
     this.device.dpsResolved[dpId] = target;
     this.refresh();
-  }
-
-  private valveDurationSeconds(): number {
-    const fromDp = parseDurationSeconds(this.dpValue(this.mapping.countdownDpId));
-    if (fromDp > 0) {
-      return fromDp;
-    }
-
-    return this.valveSetDurationSeconds;
-  }
-
-  private valveRemainingSeconds(): number {
-    const current = parseSwitchState(this.dpValue(this.mapping.switchDpId));
-    if (!current) {
-      return 0;
-    }
-
-    return this.valveDurationSeconds();
   }
 
   private dpValue(dpId: string | undefined): unknown {
