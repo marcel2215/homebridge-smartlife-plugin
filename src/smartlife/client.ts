@@ -38,6 +38,7 @@ const RETRYABLE_CODES = new Set([
   'SYSTEM_ERROR',
   'REQUEST_ERROR',
 ]);
+const NON_RETRYABLE_AUTH_COOLDOWN_MS = 30000;
 
 const ENDPOINTS: Record<'us' | 'eu' | 'in', string> = {
   us: 'https://a1-us.lifeaiot.com/api.json',
@@ -72,7 +73,9 @@ const SIGNED_KEYS = new Set([
 function backoffDelay(attempt: number): number {
   const base = 500;
   const max = 8000;
-  return Math.min(max, base * Math.pow(2, attempt - 1));
+  const raw = Math.min(max, base * Math.pow(2, attempt - 1));
+  const jitter = Math.floor(Math.random() * 300);
+  return raw + jitter;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -153,6 +156,14 @@ function normalizeApiUrl(url: string): string {
 function toErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
+  }
+
+  return String(error);
+}
+
+function toErrorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    return error.stack ?? error.message;
   }
 
   return String(error);
@@ -313,6 +324,8 @@ export class SmartLifeCloudClient {
   private endpoint = ENDPOINTS.us;
   private loginPromise?: Promise<void>;
   private readonly productRefsByHome = new Map<number, Map<string, ProductRef>>();
+  private lastNonRetryableAuthError?: SmartLifeApiError;
+  private lastNonRetryableAuthErrorAtMs = 0;
 
   constructor(options: SmartLifeCloudClientOptions) {
     this.username = options.username;
@@ -409,6 +422,20 @@ export class SmartLifeCloudClient {
     return typeof response === 'object' && response !== null ? response : {};
   }
 
+  public pruneProductRefs(homeIds: readonly number[]): void {
+    if (homeIds.length === 0) {
+      this.productRefsByHome.clear();
+      return;
+    }
+
+    const keep = new Set(homeIds);
+    for (const homeId of this.productRefsByHome.keys()) {
+      if (!keep.has(homeId)) {
+        this.productRefsByHome.delete(homeId);
+      }
+    }
+  }
+
   private async getProductRefMap(homeId: number): Promise<Map<string, ProductRef>> {
     const response = await this.requestWithRetry<unknown[]>({
       action: 'm.life.device.ref.info.my.list',
@@ -455,18 +482,26 @@ export class SmartLifeCloudClient {
         lastError = error;
 
         if (requiresSid && this.isSessionError(error)) {
-          this.debug('Session expired, re-authenticating before retry.');
+          this.debug('Session expired for action=%s attempt=%s, re-authenticating.', request.action, attempts);
           this.sid = undefined;
           await this.ensureSession(true);
           continue;
         }
 
-        if (!this.shouldRetry(error) || attempts >= this.maxRetries) {
+        if (!this.shouldRetry(error)) {
+          this.warn('Request failed without retry action=%s attempt=%s/%s error=%s',
+            request.action, attempts, this.maxRetries, toErrorDetails(error));
+          throw error;
+        }
+
+        if (attempts >= this.maxRetries) {
+          this.warn('Request failed after max retries action=%s attempts=%s error=%s',
+            request.action, attempts, toErrorDetails(error));
           throw error;
         }
 
         const delayMs = backoffDelay(attempts);
-        this.debug('Retrying %s after %sms due to: %s', request.action, delayMs, toErrorMessage(error));
+        this.debug('Retrying action=%s attempt=%s/%s after %sms due to: %s', request.action, attempts, this.maxRetries, delayMs, toErrorMessage(error));
         await sleep(delayMs);
       }
     }
@@ -475,13 +510,28 @@ export class SmartLifeCloudClient {
   }
 
   private async ensureSession(forceLogin = false): Promise<void> {
-    if (!forceLogin && this.sid) {
+    if (this.sid && !forceLogin) {
       return;
     }
 
-    if (!forceLogin && this.loginPromise) {
+    if (this.loginPromise) {
       await this.loginPromise;
-      return;
+      if (this.sid) {
+        return;
+      }
+    }
+
+    if (forceLogin) {
+      this.sid = undefined;
+    }
+
+    if (this.lastNonRetryableAuthError) {
+      const elapsedMs = Date.now() - this.lastNonRetryableAuthErrorAtMs;
+      if (elapsedMs < NON_RETRYABLE_AUTH_COOLDOWN_MS) {
+        const remainingMs = NON_RETRYABLE_AUTH_COOLDOWN_MS - elapsedMs;
+        this.warn('Skipping login retry for %sms after non-retryable auth error: %s', remainingMs, this.lastNonRetryableAuthError.code);
+        throw this.lastNonRetryableAuthError;
+      }
     }
 
     this.loginPromise = this.login().finally(() => {
@@ -511,6 +561,10 @@ export class SmartLifeCloudClient {
           },
         });
 
+        if (!token || typeof token.token !== 'string' || token.token.length === 0) {
+          throw new SmartLifeApiError('NO_TOKEN', 'Missing login token in SmartLife response', token);
+        }
+
         const login = await this.requestRaw<SmartLifeLoginResponse>({
           action: this.username.includes('@') ? 'thing.m.user.email.password.login' : 'thing.m.user.mobile.passwd.login',
           version: this.username.includes('@') ? '3.0' : '4.0',
@@ -523,6 +577,8 @@ export class SmartLifeCloudClient {
         }
 
         this.sid = login.sid;
+        this.lastNonRetryableAuthError = undefined;
+        this.lastNonRetryableAuthErrorAtMs = 0;
 
         if (typeof login.domain?.mobileApiUrl === 'string' && login.domain.mobileApiUrl.length > 0) {
           this.endpoint = normalizeApiUrl(login.domain.mobileApiUrl);
@@ -534,10 +590,12 @@ export class SmartLifeCloudClient {
         lastError = error;
 
         if (error instanceof SmartLifeApiError && LOGIN_NON_RETRYABLE_CODES.has(error.code)) {
+          this.lastNonRetryableAuthError = error;
+          this.lastNonRetryableAuthErrorAtMs = Date.now();
           throw error;
         }
 
-        this.warn('SmartLife login failed on %s: %s', endpoint, toErrorMessage(error));
+        this.warn('SmartLife login failed on %s: %s', endpoint, toErrorDetails(error));
       }
     }
 
@@ -619,10 +677,21 @@ export class SmartLifeCloudClient {
       });
 
       if (!response.ok) {
-        throw new SmartLifeApiError('HTTP_ERROR', `HTTP ${response.status} ${response.statusText}`);
+        throw new SmartLifeApiError(`HTTP_${response.status}`, `HTTP ${response.status} ${response.statusText}`);
       }
 
-      const payload = await response.json() as SmartLifeApiResponse<T>;
+      const responseText = await response.text();
+      let payload: SmartLifeApiResponse<T>;
+      try {
+        payload = JSON.parse(responseText) as SmartLifeApiResponse<T>;
+      } catch (error) {
+        throw new SmartLifeApiError('INVALID_RESPONSE', `Invalid JSON for ${request.action}: ${toErrorMessage(error)}`, responseText.slice(0, 500));
+      }
+
+      if (!payload || typeof payload !== 'object') {
+        throw new SmartLifeApiError('INVALID_RESPONSE', `Invalid response object for ${request.action}`, payload);
+      }
+
       this.trace('HTTP response for %s: %j', request.action, redactResponseForLog(payload));
 
       if (!payload.success) {
@@ -639,7 +708,7 @@ export class SmartLifeCloudClient {
         throw new SmartLifeApiError('REQUEST_TIMEOUT', `SmartLife request timed out: ${request.action}`);
       }
 
-      throw new SmartLifeApiError('NETWORK_ERROR', toErrorMessage(error));
+      throw new SmartLifeApiError('NETWORK_ERROR', `Network error for ${request.action}: ${toErrorMessage(error)}`);
     } finally {
       clearTimeout(timer);
     }
@@ -719,6 +788,10 @@ export class SmartLifeCloudClient {
       return true;
     }
 
+    if (error.code === 'HTTP_401' || error.code === 'HTTP_403') {
+      return true;
+    }
+
     const normalizedCode = error.code.toLowerCase();
     return normalizedCode.includes('session') || normalizedCode.includes('token');
   }
@@ -736,8 +809,16 @@ export class SmartLifeCloudClient {
       return true;
     }
 
+    if (/^HTTP_(429|5\d\d)$/.test(error.code)) {
+      return true;
+    }
+
     const normalized = error.code.toLowerCase();
-    return normalized.includes('timeout') || normalized.includes('network');
+    return normalized.includes('timeout')
+      || normalized.includes('network')
+      || normalized.includes('invalid_response')
+      || normalized.includes('http_429')
+      || normalized.includes('http_5');
   }
 
   private info(message: string, ...parameters: unknown[]) {

@@ -51,9 +51,13 @@ Devices/categories unsupported by native clean HomeKit mapping are skipped.
 ## Reliability behavior
 
 - automatic session/token re-login on session errors
+- cooldown for repeated non-retryable auth failures (prevents login hammering)
 - retry with exponential backoff on transient cloud failures
-- command queue per device to prevent rapid state race conditions
+- jittered retry with HTTP 429/5xx retry handling
+- command queue per device with duplicate/no-op coalescing to prevent rapid state race conditions
 - periodic discovery refresh and frequent status polling
+- accessory pruning protection during partial sync failures
+- per-device reachability tracking with HomeKit `StatusFault` and communication-failure behavior for unreachable devices
 
 ## Notes
 

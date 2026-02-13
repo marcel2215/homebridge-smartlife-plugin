@@ -28,8 +28,13 @@ function sanitizeHomeKitName(name: string): string {
   return cleaned.length > 0 ? cleaned : 'SmartLife Device';
 }
 
+type ReachabilityReason = ReturnType<SmartLifePlatform['getDeviceReachabilityReason']>;
+const BLOCKED_OPERATION_LOG_INTERVAL_MS = 30000;
+
 export class SmartLifePlatformAccessory {
   private service: Service;
+  private lastReachabilityReason?: ReachabilityReason;
+  private lastBlockedOperationLogAtMs = 0;
 
   constructor(
     private readonly platform: SmartLifePlatform,
@@ -56,6 +61,8 @@ export class SmartLifePlatformAccessory {
   }
 
   public refresh() {
+    this.updateReachabilityCharacteristics();
+
     switch (this.mapping.kind) {
     case 'switch':
     case 'outlet': {
@@ -103,7 +110,10 @@ export class SmartLifePlatformAccessory {
       break;
     }
     }
+  }
 
+  public refreshReachability() {
+    this.updateReachabilityCharacteristics();
   }
 
   private configureAccessoryInformation() {
@@ -125,34 +135,62 @@ export class SmartLifePlatformAccessory {
       this.accessory.removeService(service);
     }
 
+    let service: Service;
+
     switch (byKind) {
     case 'switch':
-      return this.accessory.addService(this.platform.Service.Switch, serviceName);
+      service = this.accessory.addService(this.platform.Service.Switch, serviceName);
+      break;
     case 'outlet':
-      return this.accessory.addService(this.platform.Service.Outlet, serviceName);
+      service = this.accessory.addService(this.platform.Service.Outlet, serviceName);
+      break;
     case 'valve':
-      return this.accessory.addService(this.platform.Service.Valve, serviceName);
+      service = this.accessory.addService(this.platform.Service.Valve, serviceName);
+      break;
     case 'contact':
-      return this.accessory.addService(this.platform.Service.ContactSensor, serviceName);
+      service = this.accessory.addService(this.platform.Service.ContactSensor, serviceName);
+      break;
     case 'leak':
-      return this.accessory.addService(this.platform.Service.LeakSensor, serviceName);
+      service = this.accessory.addService(this.platform.Service.LeakSensor, serviceName);
+      break;
     case 'smoke':
-      return this.accessory.addService(this.platform.Service.SmokeSensor, serviceName);
+      service = this.accessory.addService(this.platform.Service.SmokeSensor, serviceName);
+      break;
     case 'motion':
-      return this.accessory.addService(this.platform.Service.MotionSensor, serviceName);
+      service = this.accessory.addService(this.platform.Service.MotionSensor, serviceName);
+      break;
+    }
+
+    this.ensureOptionalStatusCharacteristics(service);
+    return service;
+  }
+
+  private ensureOptionalStatusCharacteristics(service: Service) {
+    if (!service.testCharacteristic(this.platform.Characteristic.StatusFault)) {
+      service.addOptionalCharacteristic(this.platform.Characteristic.StatusFault);
+    }
+
+    if (!service.testCharacteristic(this.platform.Characteristic.StatusActive)) {
+      service.addOptionalCharacteristic(this.platform.Characteristic.StatusActive);
     }
   }
 
   private configureHandlers() {
     if (this.mapping.kind === 'switch' || this.mapping.kind === 'outlet') {
       this.service.getCharacteristic(this.platform.Characteristic.On)
-        .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)))
+        .onGet(async () => {
+          this.assertReachable('read');
+          return parseSwitchState(this.dpValue(this.mapping.switchDpId));
+        })
         .onSet(async (value) => this.setSwitch(value));
     }
 
     if (this.mapping.kind === 'outlet') {
       this.service.getCharacteristic(this.platform.Characteristic.OutletInUse)
-        .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)));
+        .onGet(async () => {
+          this.assertReachable('read');
+          return parseSwitchState(this.dpValue(this.mapping.switchDpId));
+        });
     }
 
     if (this.mapping.kind === 'valve') {
@@ -160,6 +198,7 @@ export class SmartLifePlatformAccessory {
 
       this.service.getCharacteristic(this.platform.Characteristic.Active)
         .onGet(async () => {
+          this.assertReachable('read');
           const on = parseSwitchState(this.dpValue(this.mapping.switchDpId));
           return on ? this.platform.Characteristic.Active.ACTIVE : this.platform.Characteristic.Active.INACTIVE;
         })
@@ -169,22 +208,122 @@ export class SmartLifePlatformAccessory {
         });
 
       this.service.getCharacteristic(this.platform.Characteristic.InUse)
-        .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)) ? 1 : 0);
+        .onGet(async () => {
+          this.assertReachable('read');
+          return parseSwitchState(this.dpValue(this.mapping.switchDpId)) ? 1 : 0;
+        });
     }
+
+    if (this.mapping.kind === 'contact') {
+      this.service.getCharacteristic(this.platform.Characteristic.ContactSensorState)
+        .onGet(async () => {
+          this.assertReachable('read');
+          const isOpen = parseContactDetected(this.dpValue(this.mapping.contactDpId), this.mapping.contactDpId ?? '');
+          return isOpen
+            ? this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
+            : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED;
+        });
+    }
+
+    if (this.mapping.kind === 'leak') {
+      this.service.getCharacteristic(this.platform.Characteristic.LeakDetected)
+        .onGet(async () => {
+          this.assertReachable('read');
+          const detected = parseLeakDetected(this.dpValue(this.mapping.leakDpId));
+          return detected
+            ? this.platform.Characteristic.LeakDetected.LEAK_DETECTED
+            : this.platform.Characteristic.LeakDetected.LEAK_NOT_DETECTED;
+        });
+    }
+
+    if (this.mapping.kind === 'smoke') {
+      this.service.getCharacteristic(this.platform.Characteristic.SmokeDetected)
+        .onGet(async () => {
+          this.assertReachable('read');
+          const detected = parseSmokeDetected(this.dpValue(this.mapping.smokeDpId));
+          return detected
+            ? this.platform.Characteristic.SmokeDetected.SMOKE_DETECTED
+            : this.platform.Characteristic.SmokeDetected.SMOKE_NOT_DETECTED;
+        });
+    }
+
+    if (this.mapping.kind === 'motion') {
+      this.service.getCharacteristic(this.platform.Characteristic.MotionDetected)
+        .onGet(async () => {
+          this.assertReachable('read');
+          return parseMotionDetected(this.dpValue(this.mapping.motionDpId));
+        });
+    }
+  }
+
+  private currentReachabilityReason(): ReachabilityReason {
+    return this.platform.getDeviceReachabilityReason(this.device.devId);
+  }
+
+  private updateReachabilityCharacteristics() {
+    const reason = this.currentReachabilityReason();
+    this.logReachabilityTransition(reason);
+
+    const isReachable = reason === 'ok';
+    this.service.updateCharacteristic(this.platform.Characteristic.StatusFault,
+      isReachable
+        ? this.platform.Characteristic.StatusFault.NO_FAULT
+        : this.platform.Characteristic.StatusFault.GENERAL_FAULT);
+
+    if (this.service.testCharacteristic(this.platform.Characteristic.StatusActive)) {
+      this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, isReachable);
+    }
+  }
+
+  private logReachabilityTransition(reason: ReachabilityReason) {
+    if (this.lastReachabilityReason === reason) {
+      return;
+    }
+
+    this.lastReachabilityReason = reason;
+
+    if (reason === 'ok') {
+      this.platform.log.debug('Device reachable again: %s (%s)', this.device.name, this.device.devId);
+      return;
+    }
+
+    this.platform.log.warn('Device unreachable: %s (%s) reason=%s', this.device.name, this.device.devId, reason);
+  }
+
+  private assertReachable(operation: 'read' | 'write') {
+    const reason = this.currentReachabilityReason();
+    this.logReachabilityTransition(reason);
+
+    if (reason === 'ok') {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - this.lastBlockedOperationLogAtMs >= BLOCKED_OPERATION_LOG_INTERVAL_MS) {
+      this.platform.log.warn('Blocking %s for unreachable device: %s (%s) reason=%s', operation, this.device.name, this.device.devId, reason);
+      this.lastBlockedOperationLogAtMs = now;
+    }
+    throw this.communicationError();
+  }
+
+  private communicationError() {
+    return new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
   }
 
   private async setSwitch(value: CharacteristicValue | boolean): Promise<void> {
     const dpId = this.mapping.switchDpId;
     if (!dpId) {
-      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      throw this.communicationError();
     }
+
+    this.assertReachable('write');
 
     const target = typeof value === 'boolean' ? value : Boolean(value);
 
     try {
       await this.platform.sendDpCommand(this.device.devId, dpId, target);
     } catch {
-      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      throw this.communicationError();
     }
 
     this.device.dpsResolved[dpId] = target;

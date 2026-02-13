@@ -35,16 +35,25 @@ import {
   type SmartLifeAccessoryContext,
 } from './platformAccessory.js';
 
-function parseHomeId(home: { gid?: number; id?: number }): number | undefined {
-  if (typeof home.gid === 'number' && Number.isFinite(home.gid) && home.gid > 0) {
-    return home.gid;
+const EMPTY_HOMES_PRUNE_THRESHOLD = 3;
+
+function parsePositiveInteger(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
   }
 
-  if (typeof home.id === 'number' && Number.isFinite(home.id) && home.id > 0) {
-    return home.id;
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
   }
 
   return undefined;
+}
+
+function parseHomeId(home: { gid?: number | string; id?: number | string }): number | undefined {
+  return parsePositiveInteger(home.gid) ?? parsePositiveInteger(home.id);
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -56,12 +65,86 @@ function normalizeCountryCode(value: string): string {
   return digits.length > 0 ? digits : DEFAULT_COUNTRY_CODE;
 }
 
+function parseOptionalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value !== 0;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized.length === 0) {
+      return undefined;
+    }
+
+    if (['true', 'on', 'open', 'opened', 'yes', '1', 'active'].includes(normalized)) {
+      return true;
+    }
+
+    if (['false', 'off', 'close', 'closed', 'no', '0', 'inactive'].includes(normalized)) {
+      return false;
+    }
+  }
+
+  return undefined;
+}
+
 function toErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
 
   return String(error);
+}
+
+function toErrorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    return error.stack ?? error.message;
+  }
+
+  return String(error);
+}
+
+interface ReconcileOptions {
+  allowPrune: boolean;
+  preserveHomeIds: Set<number>;
+}
+
+function isValidDpKey(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function isValidAccessoryMapping(value: unknown): value is DeviceControlMapping {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const mapping = value as DeviceControlMapping;
+  const validKinds: DeviceControlMapping['kind'][] = ['switch', 'outlet', 'valve', 'contact', 'leak', 'smoke', 'motion'];
+  if (!validKinds.includes(mapping.kind)) {
+    return false;
+  }
+
+  if ((mapping.kind === 'switch' || mapping.kind === 'outlet' || mapping.kind === 'valve') && !isValidDpKey(mapping.switchDpId)) {
+    return false;
+  }
+  if (mapping.kind === 'contact' && !isValidDpKey(mapping.contactDpId)) {
+    return false;
+  }
+  if (mapping.kind === 'leak' && !isValidDpKey(mapping.leakDpId)) {
+    return false;
+  }
+  if (mapping.kind === 'smoke' && !isValidDpKey(mapping.smokeDpId)) {
+    return false;
+  }
+  if (mapping.kind === 'motion' && !isValidDpKey(mapping.motionDpId)) {
+    return false;
+  }
+
+  return true;
 }
 
 export class SmartLifePlatform implements DynamicPlatformPlugin {
@@ -74,16 +157,24 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
   private readonly deviceById = new Map<string, SmartLifeResolvedDevice>();
   private readonly unsupportedCategories = new Set<string>();
   private readonly commandQueue = new Map<string, Promise<void>>();
+  private readonly queuedCommandTargetByDevice = new Map<string, boolean>();
+  private readonly deviceLastSeenAtMs = new Map<string, number>();
 
   private readonly logLevel: LogLevel;
   private readonly pollIntervalSeconds: number;
   private readonly discoveryIntervalSeconds: number;
+  private readonly stateStaleAfterMs: number;
 
   private readonly client?: SmartLifeCloudClient;
 
-  private syncChain: Promise<void> = Promise.resolve();
+  private syncRunning = false;
+  private pendingSyncIncludeProductRefs = false;
+  private readonly pendingSyncReasons = new Set<string>();
+
   private pollTimer?: NodeJS.Timeout;
   private discoveryTimer?: NodeJS.Timeout;
+  private emptyHomesSyncCount = 0;
+  private shuttingDown = false;
 
   constructor(
     public readonly log: Logging,
@@ -104,6 +195,8 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
       MIN_DISCOVERY_INTERVAL_SECONDS,
       MAX_DISCOVERY_INTERVAL_SECONDS,
     );
+
+    this.stateStaleAfterMs = Math.max(30000, this.pollIntervalSeconds * 1000 * 4);
 
     const email = typeof config.email === 'string' ? config.email.trim() : '';
     const password = typeof config.password === 'string' ? config.password : '';
@@ -131,7 +224,12 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
       },
     });
 
-    this.debug('SmartLife platform initialized with poll=%ss discovery=%ss', this.pollIntervalSeconds, this.discoveryIntervalSeconds);
+    this.debug(
+      'SmartLife platform initialized with poll=%ss discovery=%ss staleAfterMs=%s',
+      this.pollIntervalSeconds,
+      this.discoveryIntervalSeconds,
+      this.stateStaleAfterMs,
+    );
 
     this.api.on('didFinishLaunching', () => {
       void this.onDidFinishLaunching();
@@ -146,6 +244,30 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
     const typedAccessory = accessory as PlatformAccessory<SmartLifeAccessoryContext>;
     this.debug('Loading accessory from cache: %s', typedAccessory.displayName);
     this.accessories.set(typedAccessory.UUID, typedAccessory);
+    this.restoreCachedAccessoryHandler(typedAccessory);
+  }
+
+  public isDeviceReachable(deviceId: string): boolean {
+    return this.getDeviceReachabilityReason(deviceId) === 'ok';
+  }
+
+  public getDeviceReachabilityReason(deviceId: string): 'ok' | 'unknown-device' | 'cloud-offline' | 'state-stale' {
+    const device = this.deviceById.get(deviceId);
+    if (!device) {
+      return 'unknown-device';
+    }
+
+    const cloudOnline = parseOptionalBoolean(device.cloudOnline);
+    if (cloudOnline === false) {
+      return 'cloud-offline';
+    }
+
+    const lastSeenAt = this.deviceLastSeenAtMs.get(deviceId);
+    if (!lastSeenAt || Date.now() - lastSeenAt > this.stateStaleAfterMs) {
+      return 'state-stale';
+    }
+
+    return 'ok';
   }
 
   public async sendDpCommand(deviceId: string, dpId: string, value: boolean): Promise<void> {
@@ -153,16 +275,48 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
       throw new Error('SmartLife client is not initialized');
     }
 
-    const previous = this.commandQueue.get(deviceId) ?? Promise.resolve();
+    const current = this.deviceById.get(deviceId);
+    const currentValue = current ? parseOptionalBoolean(current.dpsResolved[dpId]) : undefined;
+    const existingQueue = this.commandQueue.get(deviceId);
+
+    if (!existingQueue && currentValue !== undefined && currentValue === value) {
+      this.trace('Skipping no-op command devId=%s dp=%s value=%s', deviceId, dpId, value);
+      return;
+    }
+
+    if (existingQueue && this.queuedCommandTargetByDevice.get(deviceId) === value) {
+      this.trace('Coalescing duplicate command devId=%s dp=%s value=%s', deviceId, dpId, value);
+      return existingQueue;
+    }
+
+    this.queuedCommandTargetByDevice.set(deviceId, value);
+
+    const previous = existingQueue ?? Promise.resolve();
 
     const next = previous
       .catch(() => undefined)
       .then(async () => {
+        const latestDesired = this.queuedCommandTargetByDevice.get(deviceId);
+        if (latestDesired !== undefined && latestDesired !== value) {
+          this.trace('Dropping stale command devId=%s dp=%s value=%s latest=%s', deviceId, dpId, value, latestDesired);
+          return;
+        }
+
         try {
           await this.client!.publishDp(deviceId, { [dpId]: value });
+
+          const device = this.deviceById.get(deviceId);
+          if (device) {
+            device.dpsResolved[dpId] = value;
+            this.markDeviceSeen(deviceId);
+            const uuid = this.api.hap.uuid.generate(deviceId);
+            this.accessoryHandlers.get(uuid)?.refresh();
+          }
+
+          void this.refreshDeviceDp(deviceId);
           this.trace('DP publish success devId=%s dp=%s value=%s', deviceId, dpId, value);
         } catch (error) {
-          this.warn('DP publish failed devId=%s dp=%s: %s', deviceId, dpId, toErrorMessage(error));
+          this.warn('DP publish failed devId=%s dp=%s value=%s error=%s', deviceId, dpId, value, toErrorDetails(error));
           await this.refreshDeviceDp(deviceId);
           throw error;
         }
@@ -170,11 +324,16 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
       .finally(() => {
         if (this.commandQueue.get(deviceId) === next) {
           this.commandQueue.delete(deviceId);
+          this.queuedCommandTargetByDevice.delete(deviceId);
         }
       });
 
     this.commandQueue.set(deviceId, next);
     return next;
+  }
+
+  private markDeviceSeen(deviceId: string) {
+    this.deviceLastSeenAtMs.set(deviceId, Date.now());
   }
 
   private async onDidFinishLaunching(): Promise<void> {
@@ -196,6 +355,8 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
   }
 
   private stopTimers() {
+    this.shuttingDown = true;
+
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;
@@ -208,14 +369,47 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
   }
 
   private async enqueueSync(includeProductRefs: boolean, reason: string): Promise<void> {
-    this.syncChain = this.syncChain
-      .then(async () => this.syncOnce(includeProductRefs, reason))
-      .catch((error) => {
-        const details = error instanceof Error && error.stack ? error.stack : toErrorMessage(error);
-        this.error('SmartLife sync chain error: %s', details);
-      });
+    if (!this.client || this.shuttingDown) {
+      return;
+    }
 
-    return this.syncChain;
+    if (this.syncRunning) {
+      this.pendingSyncIncludeProductRefs = this.pendingSyncIncludeProductRefs || includeProductRefs;
+      this.pendingSyncReasons.add(reason);
+      this.trace('Coalescing sync request reason=%s includeProductRefs=%s', reason, includeProductRefs);
+      return;
+    }
+
+    this.syncRunning = true;
+
+    let nextIncludeProductRefs = includeProductRefs;
+    let nextReason = reason;
+
+    try {
+      while (!this.shuttingDown) {
+        try {
+          await this.syncOnce(nextIncludeProductRefs, nextReason);
+        } catch (error) {
+          this.error('SmartLife sync failed (%s): %s', nextReason, toErrorDetails(error));
+        } finally {
+          this.refreshAllAccessoryReachability();
+        }
+
+        if (!this.pendingSyncIncludeProductRefs && this.pendingSyncReasons.size === 0) {
+          break;
+        }
+
+        nextIncludeProductRefs = this.pendingSyncIncludeProductRefs;
+        nextReason = this.pendingSyncReasons.size > 0
+          ? `coalesced:${Array.from(this.pendingSyncReasons).join('+')}`
+          : 'coalesced';
+
+        this.pendingSyncIncludeProductRefs = false;
+        this.pendingSyncReasons.clear();
+      }
+    } finally {
+      this.syncRunning = false;
+    }
   }
 
   private async syncOnce(includeProductRefs: boolean, reason: string): Promise<void> {
@@ -226,17 +420,32 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
     this.debug('Starting SmartLife sync (%s, includeProductRefs=%s)', reason, includeProductRefs);
 
     const homes = await this.client.listHomes();
-    const homeIds = homes
-      .map((home) => parseHomeId(home))
-      .filter((homeId): homeId is number => homeId !== undefined);
+    const homeIds = Array.from(new Set(
+      homes
+        .map((home) => parseHomeId(home))
+        .filter((homeId): homeId is number => homeId !== undefined),
+    ));
 
     if (homeIds.length === 0) {
-      this.warn('No SmartLife homes found.');
-      this.reconcileAccessories([]);
+      this.emptyHomesSyncCount += 1;
+      this.warn('No SmartLife homes found (attempt=%s).', this.emptyHomesSyncCount);
+
+      if (includeProductRefs && this.emptyHomesSyncCount >= EMPTY_HOMES_PRUNE_THRESHOLD) {
+        this.warn('Pruning cached accessories after %s consecutive empty home syncs.', this.emptyHomesSyncCount);
+        this.reconcileAccessories([], {
+          allowPrune: true,
+          preserveHomeIds: new Set<number>(),
+        });
+      }
+
       return;
     }
 
+    this.emptyHomesSyncCount = 0;
+    this.client.pruneProductRefs(homeIds);
+
     const devices: SmartLifeResolvedDevice[] = [];
+    const failedHomeIds = new Set<number>();
 
     for (const homeId of homeIds) {
       try {
@@ -248,29 +457,41 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
           }
         }
       } catch (error) {
-        this.warn('Home %s sync failed: %s', homeId, toErrorMessage(error));
+        failedHomeIds.add(homeId);
+        this.warn('Home sync failed homeId=%s reason=%s', homeId, toErrorDetails(error));
       }
     }
 
-    this.reconcileAccessories(devices);
-    this.trace('SmartLife sync complete: homes=%s devices=%s', homeIds.length, devices.length);
+    this.reconcileAccessories(devices, {
+      allowPrune: includeProductRefs,
+      preserveHomeIds: failedHomeIds,
+    });
+
+    this.trace('SmartLife sync complete reason=%s homes=%s devices=%s failedHomes=%s', reason, homeIds.length, devices.length, failedHomeIds.size);
   }
 
-  private reconcileAccessories(devices: SmartLifeResolvedDevice[]) {
+  private reconcileAccessories(devices: SmartLifeResolvedDevice[], options: ReconcileOptions) {
     const seen = new Set<string>();
 
     for (const device of devices) {
-      const mapping = classifyAndMapDevice(device);
+      const uuid = this.api.hap.uuid.generate(device.devId);
+      const existing = this.accessories.get(uuid);
+
+      let mapping = classifyAndMapDevice(device);
+      if (!mapping && existing && isValidAccessoryMapping(existing.context.mapping)) {
+        mapping = existing.context.mapping;
+        this.debug('Using cached mapping for device with incomplete cloud payload: %s (%s)', device.name, device.devId);
+      }
+
       if (!mapping) {
         this.markUnsupportedCategory(device.categoryResolved);
         continue;
       }
 
-      const uuid = this.api.hap.uuid.generate(device.devId);
       seen.add(uuid);
       this.deviceById.set(device.devId, device);
+      this.markDeviceSeen(device.devId);
 
-      const existing = this.accessories.get(uuid);
       if (existing) {
         this.upsertExistingAccessory(existing, device, mapping);
       } else {
@@ -278,10 +499,22 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
       }
     }
 
+    if (!options.allowPrune) {
+      return;
+    }
+
     for (const [uuid, accessory] of this.accessories) {
-      if (!seen.has(uuid)) {
-        this.removeAccessory(accessory);
+      if (seen.has(uuid)) {
+        continue;
       }
+
+      const homeId = accessory.context.homeId;
+      if (typeof homeId === 'number' && options.preserveHomeIds.has(homeId)) {
+        this.debug('Preserving accessory during partial sync failure: %s (homeId=%s)', accessory.displayName, homeId);
+        continue;
+      }
+
+      this.removeAccessory(accessory);
     }
   }
 
@@ -355,6 +588,9 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
     const deviceId = accessory.context.deviceId;
     if (deviceId) {
       this.deviceById.delete(deviceId);
+      this.deviceLastSeenAtMs.delete(deviceId);
+      this.commandQueue.delete(deviceId);
+      this.queuedCommandTargetByDevice.delete(deviceId);
     }
   }
 
@@ -371,6 +607,7 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
       }
 
       current.dpsResolved = latest;
+      this.markDeviceSeen(deviceId);
       const uuid = this.api.hap.uuid.generate(deviceId);
       this.accessoryHandlers.get(uuid)?.refresh();
     } catch (error) {
@@ -385,6 +622,43 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
 
     this.unsupportedCategories.add(category);
     this.warn('Skipping unsupported SmartLife category for HomeKit exposure: %s', category);
+  }
+
+  private restoreCachedAccessoryHandler(accessory: PlatformAccessory<SmartLifeAccessoryContext>) {
+    const context = accessory.context;
+    if (!context || !context.deviceId || !isValidAccessoryMapping(context.mapping)) {
+      this.debug('Skipping cached handler restore for %s due to incomplete context.', accessory.displayName);
+      return;
+    }
+
+    if (this.accessoryHandlers.has(accessory.UUID)) {
+      return;
+    }
+
+    const homeId = parsePositiveInteger(context.homeId) ?? 0;
+    const category = typeof context.category === 'string' && context.category.length > 0 ? context.category : 'unknown';
+
+    const placeholderDevice: SmartLifeResolvedDevice = {
+      devId: context.deviceId,
+      name: accessory.displayName || context.deviceId,
+      homeId,
+      categoryResolved: category,
+      dpsResolved: {},
+      category,
+    };
+
+    this.deviceById.set(context.deviceId, placeholderDevice);
+    this.accessoryHandlers.set(
+      accessory.UUID,
+      new SmartLifePlatformAccessory(this, accessory, placeholderDevice, context.mapping),
+    );
+    this.debug('Restored cached accessory handler: %s (%s)', accessory.displayName, context.deviceId);
+  }
+
+  private refreshAllAccessoryReachability() {
+    for (const handler of this.accessoryHandlers.values()) {
+      handler.refreshReachability();
+    }
   }
 
   private info(message: string, ...parameters: unknown[]) {
