@@ -169,10 +169,6 @@ export class SmartLifePlatformAccessory {
     if (!service.testCharacteristic(this.platform.Characteristic.StatusFault)) {
       service.addOptionalCharacteristic(this.platform.Characteristic.StatusFault);
     }
-
-    if (!service.testCharacteristic(this.platform.Characteristic.StatusActive)) {
-      service.addOptionalCharacteristic(this.platform.Characteristic.StatusActive);
-    }
   }
 
   private configureHandlers() {
@@ -253,10 +249,6 @@ export class SmartLifePlatformAccessory {
       isReachable
         ? this.platform.Characteristic.StatusFault.NO_FAULT
         : this.platform.Characteristic.StatusFault.GENERAL_FAULT);
-
-    if (this.service.testCharacteristic(this.platform.Characteristic.StatusActive)) {
-      this.service.updateCharacteristic(this.platform.Characteristic.StatusActive, isReachable);
-    }
   }
 
   private logReachabilityTransition(reason: ReachabilityReason) {
