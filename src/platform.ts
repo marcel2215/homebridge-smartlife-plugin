@@ -36,6 +36,7 @@ import {
 } from './platformAccessory.js';
 
 const EMPTY_HOMES_PRUNE_THRESHOLD = 3;
+const COMMAND_STATE_GRACE_MS = 8000;
 
 function parsePositiveInteger(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
@@ -113,6 +114,11 @@ interface ReconcileOptions {
   preserveHomeIds: Set<number>;
 }
 
+interface PendingDpWrite {
+  value: boolean;
+  expiresAtMs: number;
+}
+
 function isValidDpKey(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
@@ -159,6 +165,7 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
   private readonly commandQueue = new Map<string, Promise<void>>();
   private readonly queuedCommandTargetByDevice = new Map<string, boolean>();
   private readonly deviceLastSeenAtMs = new Map<string, number>();
+  private readonly pendingDpWrites = new Map<string, Map<string, PendingDpWrite>>();
 
   private readonly logLevel: LogLevel;
   private readonly pollIntervalSeconds: number;
@@ -304,6 +311,7 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
 
         try {
           await this.client!.publishDp(deviceId, { [dpId]: value });
+          this.setPendingDpWrite(deviceId, dpId, value);
 
           const device = this.deviceById.get(deviceId);
           if (device) {
@@ -489,6 +497,7 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
       }
 
       seen.add(uuid);
+      this.applyPendingDpWriteOverrides(device);
       this.deviceById.set(device.devId, device);
       this.markDeviceSeen(device.devId);
 
@@ -591,6 +600,7 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
       this.deviceLastSeenAtMs.delete(deviceId);
       this.commandQueue.delete(deviceId);
       this.queuedCommandTargetByDevice.delete(deviceId);
+      this.pendingDpWrites.delete(deviceId);
     }
   }
 
@@ -607,11 +617,56 @@ export class SmartLifePlatform implements DynamicPlatformPlugin {
       }
 
       current.dpsResolved = latest;
+      this.applyPendingDpWriteOverrides(current);
       this.markDeviceSeen(deviceId);
       const uuid = this.api.hap.uuid.generate(deviceId);
       this.accessoryHandlers.get(uuid)?.refresh();
     } catch (error) {
       this.debug('Device DP refresh failed devId=%s: %s', deviceId, toErrorMessage(error));
+    }
+  }
+
+  private setPendingDpWrite(deviceId: string, dpId: string, value: boolean) {
+    const byDp = this.pendingDpWrites.get(deviceId) ?? new Map<string, PendingDpWrite>();
+    byDp.set(dpId, {
+      value,
+      expiresAtMs: Date.now() + COMMAND_STATE_GRACE_MS,
+    });
+    this.pendingDpWrites.set(deviceId, byDp);
+  }
+
+  private applyPendingDpWriteOverrides(device: SmartLifeResolvedDevice) {
+    const byDp = this.pendingDpWrites.get(device.devId);
+    if (!byDp || byDp.size === 0) {
+      return;
+    }
+
+    const now = Date.now();
+    let suppressed = 0;
+
+    for (const [dpId, pending] of byDp) {
+      const currentValue = parseOptionalBoolean(device.dpsResolved[dpId]);
+
+      if (currentValue === pending.value) {
+        byDp.delete(dpId);
+        continue;
+      }
+
+      if (now > pending.expiresAtMs) {
+        byDp.delete(dpId);
+        continue;
+      }
+
+      device.dpsResolved[dpId] = pending.value;
+      suppressed += 1;
+    }
+
+    if (byDp.size === 0) {
+      this.pendingDpWrites.delete(device.devId);
+    }
+
+    if (suppressed > 0) {
+      this.trace('Suppressed stale DP rollback devId=%s count=%s', device.devId, suppressed);
     }
   }
 

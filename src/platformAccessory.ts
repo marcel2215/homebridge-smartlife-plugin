@@ -178,19 +178,13 @@ export class SmartLifePlatformAccessory {
   private configureHandlers() {
     if (this.mapping.kind === 'switch' || this.mapping.kind === 'outlet') {
       this.service.getCharacteristic(this.platform.Characteristic.On)
-        .onGet(async () => {
-          this.assertReachable('read');
-          return parseSwitchState(this.dpValue(this.mapping.switchDpId));
-        })
+        .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)))
         .onSet(async (value) => this.setSwitch(value));
     }
 
     if (this.mapping.kind === 'outlet') {
       this.service.getCharacteristic(this.platform.Characteristic.OutletInUse)
-        .onGet(async () => {
-          this.assertReachable('read');
-          return parseSwitchState(this.dpValue(this.mapping.switchDpId));
-        });
+        .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)));
     }
 
     if (this.mapping.kind === 'valve') {
@@ -198,7 +192,6 @@ export class SmartLifePlatformAccessory {
 
       this.service.getCharacteristic(this.platform.Characteristic.Active)
         .onGet(async () => {
-          this.assertReachable('read');
           const on = parseSwitchState(this.dpValue(this.mapping.switchDpId));
           return on ? this.platform.Characteristic.Active.ACTIVE : this.platform.Characteristic.Active.INACTIVE;
         })
@@ -208,16 +201,12 @@ export class SmartLifePlatformAccessory {
         });
 
       this.service.getCharacteristic(this.platform.Characteristic.InUse)
-        .onGet(async () => {
-          this.assertReachable('read');
-          return parseSwitchState(this.dpValue(this.mapping.switchDpId)) ? 1 : 0;
-        });
+        .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)) ? 1 : 0);
     }
 
     if (this.mapping.kind === 'contact') {
       this.service.getCharacteristic(this.platform.Characteristic.ContactSensorState)
         .onGet(async () => {
-          this.assertReachable('read');
           const isOpen = parseContactDetected(this.dpValue(this.mapping.contactDpId), this.mapping.contactDpId ?? '');
           return isOpen
             ? this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
@@ -228,7 +217,6 @@ export class SmartLifePlatformAccessory {
     if (this.mapping.kind === 'leak') {
       this.service.getCharacteristic(this.platform.Characteristic.LeakDetected)
         .onGet(async () => {
-          this.assertReachable('read');
           const detected = parseLeakDetected(this.dpValue(this.mapping.leakDpId));
           return detected
             ? this.platform.Characteristic.LeakDetected.LEAK_DETECTED
@@ -239,7 +227,6 @@ export class SmartLifePlatformAccessory {
     if (this.mapping.kind === 'smoke') {
       this.service.getCharacteristic(this.platform.Characteristic.SmokeDetected)
         .onGet(async () => {
-          this.assertReachable('read');
           const detected = parseSmokeDetected(this.dpValue(this.mapping.smokeDpId));
           return detected
             ? this.platform.Characteristic.SmokeDetected.SMOKE_DETECTED
@@ -249,10 +236,7 @@ export class SmartLifePlatformAccessory {
 
     if (this.mapping.kind === 'motion') {
       this.service.getCharacteristic(this.platform.Characteristic.MotionDetected)
-        .onGet(async () => {
-          this.assertReachable('read');
-          return parseMotionDetected(this.dpValue(this.mapping.motionDpId));
-        });
+        .onGet(async () => parseMotionDetected(this.dpValue(this.mapping.motionDpId)));
     }
   }
 
@@ -290,7 +274,7 @@ export class SmartLifePlatformAccessory {
     this.platform.log.warn('Device unreachable: %s (%s) reason=%s', this.device.name, this.device.devId, reason);
   }
 
-  private assertReachable(operation: 'read' | 'write') {
+  private assertReachableForWrite() {
     const reason = this.currentReachabilityReason();
     this.logReachabilityTransition(reason);
 
@@ -300,7 +284,7 @@ export class SmartLifePlatformAccessory {
 
     const now = Date.now();
     if (now - this.lastBlockedOperationLogAtMs >= BLOCKED_OPERATION_LOG_INTERVAL_MS) {
-      this.platform.log.warn('Blocking %s for unreachable device: %s (%s) reason=%s', operation, this.device.name, this.device.devId, reason);
+      this.platform.log.warn('Blocking write for unreachable device: %s (%s) reason=%s', this.device.name, this.device.devId, reason);
       this.lastBlockedOperationLogAtMs = now;
     }
     throw this.communicationError();
@@ -316,7 +300,7 @@ export class SmartLifePlatformAccessory {
       throw this.communicationError();
     }
 
-    this.assertReachable('write');
+    this.assertReachableForWrite();
 
     const target = typeof value === 'boolean' ? value : Boolean(value);
 
