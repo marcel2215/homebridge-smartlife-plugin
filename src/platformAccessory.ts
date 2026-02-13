@@ -156,7 +156,7 @@ export class SmartLifePlatformAccessory {
     }
 
     if (this.mapping.kind === 'valve') {
-      this.service.setCharacteristic(this.platform.Characteristic.ValveType, this.platform.Characteristic.ValveType.IRRIGATION);
+      this.service.setCharacteristic(this.platform.Characteristic.ValveType, this.platform.Characteristic.ValveType.GENERIC_VALVE);
 
       this.service.getCharacteristic(this.platform.Characteristic.Active)
         .onGet(async () => {
