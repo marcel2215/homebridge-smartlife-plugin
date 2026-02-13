@@ -2,7 +2,7 @@
   "name": "homebridge-smartlife-cloud",
   "displayName": "SmartLife Cloud",
   "type": "module",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Homebridge platform plugin that controls SmartLife devices through SmartLife cloud.",
   "author": "Marcel",
   "license": "Apache-2.0",
