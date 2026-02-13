@@ -1,150 +1,413 @@
-import type { API, Characteristic, DynamicPlatformPlugin, Logging, PlatformAccessory, PlatformConfig, Service } from 'homebridge';
+import type {
+  API,
+  Characteristic,
+  DynamicPlatformPlugin,
+  Logging,
+  PlatformAccessory,
+  Service,
+} from 'homebridge';
 
-import { ExamplePlatformAccessory } from './platformAccessory.js';
+import {
+  MAX_DISCOVERY_INTERVAL_SECONDS,
+  MAX_POLL_INTERVAL_SECONDS,
+  MIN_DISCOVERY_INTERVAL_SECONDS,
+  MIN_POLL_INTERVAL_SECONDS,
+  DEFAULT_COUNTRY_CODE,
+  DEFAULT_DISCOVERY_INTERVAL_SECONDS,
+  DEFAULT_LOG_LEVEL,
+  DEFAULT_MAX_RETRIES,
+  DEFAULT_POLL_INTERVAL_SECONDS,
+  DEFAULT_REGION,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  type LogLevel,
+  type SmartLifePlatformConfig,
+} from './config.js';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js';
+import {
+  classifyAndMapDevice,
+  type DeviceControlMapping,
+  resolveDevice,
+} from './deviceMapping.js';
+import { SmartLifeCloudClient } from './smartlife/client.js';
+import type { SmartLifeResolvedDevice } from './smartlife/types.js';
+import {
+  SmartLifePlatformAccessory,
+  type SmartLifeAccessoryContext,
+} from './platformAccessory.js';
 
-// This is only required when using Custom Services and Characteristics not support by HomeKit
-import { EveHomeKitTypes } from 'homebridge-lib/EveHomeKitTypes';
+function parseHomeId(home: { gid?: number; id?: number }): number | undefined {
+  if (typeof home.gid === 'number' && Number.isFinite(home.gid) && home.gid > 0) {
+    return home.gid;
+  }
 
-/**
- * HomebridgePlatform
- * This class is the main constructor for your plugin, this is where you should
- * parse the user config and discover/register accessories with Homebridge.
- */
-export class ExampleHomebridgePlatform implements DynamicPlatformPlugin {
+  if (typeof home.id === 'number' && Number.isFinite(home.id) && home.id > 0) {
+    return home.id;
+  }
+
+  return undefined;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function normalizeCountryCode(value: string): string {
+  const digits = value.replace(/[^0-9]/g, '');
+  return digits.length > 0 ? digits : DEFAULT_COUNTRY_CODE;
+}
+
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+export class SmartLifePlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
 
-  // this is used to track restored cached accessories
-  public readonly accessories: Map<string, PlatformAccessory> = new Map();
-  public readonly discoveredCacheUUIDs: string[] = [];
+  public readonly accessories: Map<string, PlatformAccessory<SmartLifeAccessoryContext>> = new Map();
 
-  // This is only required when using Custom Services and Characteristics not support by HomeKit
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public readonly CustomServices: any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  public readonly CustomCharacteristics: any;
+  private readonly accessoryHandlers = new Map<string, SmartLifePlatformAccessory>();
+  private readonly deviceById = new Map<string, SmartLifeResolvedDevice>();
+  private readonly unsupportedCategories = new Set<string>();
+  private readonly commandQueue = new Map<string, Promise<void>>();
+
+  private readonly logLevel: LogLevel;
+  private readonly pollIntervalSeconds: number;
+  private readonly discoveryIntervalSeconds: number;
+
+  private readonly client?: SmartLifeCloudClient;
+
+  private syncChain: Promise<void> = Promise.resolve();
+  private pollTimer?: NodeJS.Timeout;
+  private discoveryTimer?: NodeJS.Timeout;
 
   constructor(
     public readonly log: Logging,
-    public readonly config: PlatformConfig,
+    public readonly config: SmartLifePlatformConfig,
     public readonly api: API,
   ) {
     this.Service = api.hap.Service;
     this.Characteristic = api.hap.Characteristic;
 
-    // This is only required when using Custom Services and Characteristics not support by HomeKit
-    this.CustomServices = new EveHomeKitTypes(this.api).Services;
-    this.CustomCharacteristics = new EveHomeKitTypes(this.api).Characteristics;
+    this.logLevel = config.logLevel ?? DEFAULT_LOG_LEVEL;
+    this.pollIntervalSeconds = clamp(
+      config.pollIntervalSeconds ?? DEFAULT_POLL_INTERVAL_SECONDS,
+      MIN_POLL_INTERVAL_SECONDS,
+      MAX_POLL_INTERVAL_SECONDS,
+    );
+    this.discoveryIntervalSeconds = clamp(
+      config.discoveryIntervalSeconds ?? DEFAULT_DISCOVERY_INTERVAL_SECONDS,
+      MIN_DISCOVERY_INTERVAL_SECONDS,
+      MAX_DISCOVERY_INTERVAL_SECONDS,
+    );
 
-    this.log.debug('Finished initializing platform:', this.config.name);
+    const email = typeof config.email === 'string' ? config.email.trim() : '';
+    const password = typeof config.password === 'string' ? config.password : '';
 
-    // When this event is fired it means Homebridge has restored all cached accessories from disk.
-    // Dynamic Platform plugins should only register new accessories after this event was fired,
-    // in order to ensure they weren't added to homebridge already. This event can also be used
-    // to start discovery of new accessories.
+    if (!email || !password) {
+      this.log.error('SmartLife email and password are required. Platform disabled.');
+      return;
+    }
+
+    const countryCode = normalizeCountryCode(config.countryCode ?? DEFAULT_COUNTRY_CODE);
+
+    this.client = new SmartLifeCloudClient({
+      username: email,
+      password,
+      countryCode,
+      region: config.region ?? DEFAULT_REGION,
+      requestTimeoutMs: config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+      maxRetries: clamp(config.maxRetries ?? DEFAULT_MAX_RETRIES, 1, 10),
+      logLevel: this.logLevel,
+      logger: {
+        info: this.log.info.bind(this.log),
+        warn: this.log.warn.bind(this.log),
+        error: this.log.error.bind(this.log),
+        debug: this.log.debug.bind(this.log),
+      },
+    });
+
+    this.debug('SmartLife platform initialized with poll=%ss discovery=%ss', this.pollIntervalSeconds, this.discoveryIntervalSeconds);
+
     this.api.on('didFinishLaunching', () => {
-      log.debug('Executed didFinishLaunching callback');
-      // run the method to discover / register your devices as accessories
-      this.discoverDevices();
+      void this.onDidFinishLaunching();
+    });
+
+    this.api.on('shutdown', () => {
+      this.stopTimers();
     });
   }
 
-  /**
-   * This function is invoked when homebridge restores cached accessories from disk at startup.
-   * It should be used to set up event handlers for characteristics and update respective values.
-   */
-  configureAccessory(accessory: PlatformAccessory) {
-    this.log.info('Loading accessory from cache:', accessory.displayName);
-
-    // add the restored accessory to the accessories cache, so we can track if it has already been registered
-    this.accessories.set(accessory.UUID, accessory);
+  public configureAccessory(accessory: PlatformAccessory) {
+    const typedAccessory = accessory as PlatformAccessory<SmartLifeAccessoryContext>;
+    this.debug('Loading accessory from cache: %s', typedAccessory.displayName);
+    this.accessories.set(typedAccessory.UUID, typedAccessory);
   }
 
-  /**
-   * This is an example method showing how to register discovered accessories.
-   * Accessories must only be registered once, previously created accessories
-   * must not be registered again to prevent "duplicate UUID" errors.
-   */
-  discoverDevices() {
-    // EXAMPLE ONLY
-    // A real plugin you would discover accessories from the local network, cloud services
-    // or a user-defined array in the platform config.
-    const exampleDevices = [
-      {
-        exampleUniqueId: 'ABCD',
-        exampleDisplayName: 'Bedroom',
-      },
-      {
-        exampleUniqueId: 'EFGH',
-        exampleDisplayName: 'Kitchen',
-      },
-      {
-        // This is an example of a device which uses a Custom Service
-        exampleUniqueId: 'IJKL',
-        exampleDisplayName: 'Backyard',
-        CustomService: 'AirPressureSensor',
-      },
-    ];
-
-    // loop over the discovered devices and register each one if it has not already been registered
-    for (const device of exampleDevices) {
-      // generate a unique id for the accessory this should be generated from
-      // something globally unique, but constant, for example, the device serial
-      // number or MAC address
-      const uuid = this.api.hap.uuid.generate(device.exampleUniqueId);
-
-      // see if an accessory with the same uuid has already been registered and restored from
-      // the cached devices we stored in the `configureAccessory` method above
-      const existingAccessory = this.accessories.get(uuid);
-
-      if (existingAccessory) {
-        // the accessory already exists
-        this.log.info('Restoring existing accessory from cache:', existingAccessory.displayName);
-
-        // if you need to update the accessory.context then you should run `api.updatePlatformAccessories`. e.g.:
-        // existingAccessory.context.device = device;
-        // this.api.updatePlatformAccessories([existingAccessory]);
-
-        // create the accessory handler for the restored accessory
-        // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, existingAccessory);
-
-        // it is possible to remove platform accessories at any time using `api.unregisterPlatformAccessories`, e.g.:
-        // remove platform accessories when no longer present
-        // this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [existingAccessory]);
-        // this.log.info('Removing existing accessory from cache:', existingAccessory.displayName);
-      } else {
-        // the accessory does not yet exist, so we need to create it
-        this.log.info('Adding new accessory:', device.exampleDisplayName);
-
-        // create a new accessory
-        const accessory = new this.api.platformAccessory(device.exampleDisplayName, uuid);
-
-        // store a copy of the device object in the `accessory.context`
-        // the `context` property can be used to store any data about the accessory you may need
-        accessory.context.device = device;
-
-        // create the accessory handler for the newly create accessory
-        // this is imported from `platformAccessory.ts`
-        new ExamplePlatformAccessory(this, accessory);
-
-        // link the accessory to your platform
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-      }
-
-      // push into discoveredCacheUUIDs
-      this.discoveredCacheUUIDs.push(uuid);
+  public async sendDpCommand(deviceId: string, dpId: string, value: boolean): Promise<void> {
+    if (!this.client) {
+      throw new Error('SmartLife client is not initialized');
     }
 
-    // you can also deal with accessories from the cache which are no longer present by removing them from Homebridge
-    // for example, if your plugin logs into a cloud account to retrieve a device list, and a user has previously removed a device
-    // from this cloud account, then this device will no longer be present in the device list but will still be in the Homebridge cache
-    for (const [uuid, accessory] of this.accessories) {
-      if (!this.discoveredCacheUUIDs.includes(uuid)) {
-        this.log.info('Removing existing accessory from cache:', accessory.displayName);
-        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    const previous = this.commandQueue.get(deviceId) ?? Promise.resolve();
+
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          await this.client!.publishDp(deviceId, { [dpId]: value });
+          this.trace('DP publish success devId=%s dp=%s value=%s', deviceId, dpId, value);
+        } catch (error) {
+          this.warn('DP publish failed devId=%s dp=%s: %s', deviceId, dpId, toErrorMessage(error));
+          await this.refreshDeviceDp(deviceId);
+          throw error;
+        }
+      })
+      .finally(() => {
+        if (this.commandQueue.get(deviceId) === next) {
+          this.commandQueue.delete(deviceId);
+        }
+      });
+
+    this.commandQueue.set(deviceId, next);
+    return next;
+  }
+
+  private async onDidFinishLaunching(): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+
+    await this.enqueueSync(true, 'startup');
+
+    this.pollTimer = setInterval(() => {
+      void this.enqueueSync(false, 'poll');
+    }, this.pollIntervalSeconds * 1000);
+
+    this.discoveryTimer = setInterval(() => {
+      void this.enqueueSync(true, 'discovery');
+    }, this.discoveryIntervalSeconds * 1000);
+
+    this.info('SmartLife polling enabled (%ss) with discovery refresh (%ss)', this.pollIntervalSeconds, this.discoveryIntervalSeconds);
+  }
+
+  private stopTimers() {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = undefined;
+    }
+
+    if (this.discoveryTimer) {
+      clearInterval(this.discoveryTimer);
+      this.discoveryTimer = undefined;
+    }
+  }
+
+  private async enqueueSync(includeProductRefs: boolean, reason: string): Promise<void> {
+    this.syncChain = this.syncChain
+      .then(async () => this.syncOnce(includeProductRefs, reason))
+      .catch((error) => {
+        const details = error instanceof Error && error.stack ? error.stack : toErrorMessage(error);
+        this.error('SmartLife sync chain error: %s', details);
+      });
+
+    return this.syncChain;
+  }
+
+  private async syncOnce(includeProductRefs: boolean, reason: string): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+
+    this.debug('Starting SmartLife sync (%s, includeProductRefs=%s)', reason, includeProductRefs);
+
+    const homes = await this.client.listHomes();
+    const homeIds = homes
+      .map((home) => parseHomeId(home))
+      .filter((homeId): homeId is number => homeId !== undefined);
+
+    if (homeIds.length === 0) {
+      this.warn('No SmartLife homes found.');
+      this.reconcileAccessories([]);
+      return;
+    }
+
+    const devices: SmartLifeResolvedDevice[] = [];
+
+    for (const homeId of homeIds) {
+      try {
+        const homeDevices = await this.client.listHomeDevices(homeId, includeProductRefs);
+        for (const rawDevice of homeDevices) {
+          const resolved = resolveDevice(rawDevice, homeId);
+          if (resolved) {
+            devices.push(resolved);
+          }
+        }
+      } catch (error) {
+        this.warn('Home %s sync failed: %s', homeId, toErrorMessage(error));
       }
+    }
+
+    this.reconcileAccessories(devices);
+    this.trace('SmartLife sync complete: homes=%s devices=%s', homeIds.length, devices.length);
+  }
+
+  private reconcileAccessories(devices: SmartLifeResolvedDevice[]) {
+    const seen = new Set<string>();
+
+    for (const device of devices) {
+      const mapping = classifyAndMapDevice(device);
+      if (!mapping) {
+        this.markUnsupportedCategory(device.categoryResolved);
+        continue;
+      }
+
+      const uuid = this.api.hap.uuid.generate(device.devId);
+      seen.add(uuid);
+      this.deviceById.set(device.devId, device);
+
+      const existing = this.accessories.get(uuid);
+      if (existing) {
+        this.upsertExistingAccessory(existing, device, mapping);
+      } else {
+        this.addNewAccessory(uuid, device, mapping);
+      }
+    }
+
+    for (const [uuid, accessory] of this.accessories) {
+      if (!seen.has(uuid)) {
+        this.removeAccessory(accessory);
+      }
+    }
+  }
+
+  private upsertExistingAccessory(
+    accessory: PlatformAccessory<SmartLifeAccessoryContext>,
+    device: SmartLifeResolvedDevice,
+    mapping: DeviceControlMapping,
+  ) {
+    const previousKind = accessory.context.kind;
+    accessory.displayName = device.name;
+
+    const contextChanged =
+      accessory.context.deviceId !== device.devId
+      || accessory.context.homeId !== device.homeId
+      || accessory.context.kind !== mapping.kind
+      || accessory.context.category !== device.categoryResolved
+      || JSON.stringify(accessory.context.mapping) !== JSON.stringify(mapping);
+
+    if (contextChanged) {
+      accessory.context.deviceId = device.devId;
+      accessory.context.homeId = device.homeId;
+      accessory.context.kind = mapping.kind;
+      accessory.context.category = device.categoryResolved;
+      accessory.context.mapping = mapping;
+      this.api.updatePlatformAccessories([accessory]);
+    }
+
+    const existingHandler = this.accessoryHandlers.get(accessory.UUID);
+    if (!existingHandler || previousKind !== mapping.kind) {
+      this.accessoryHandlers.set(
+        accessory.UUID,
+        new SmartLifePlatformAccessory(this, accessory, device, mapping),
+      );
+      return;
+    }
+
+    existingHandler.update(device, mapping);
+  }
+
+  private addNewAccessory(uuid: string, device: SmartLifeResolvedDevice, mapping: DeviceControlMapping) {
+    const accessory = new this.api.platformAccessory<SmartLifeAccessoryContext>(device.name, uuid);
+    accessory.context.deviceId = device.devId;
+    accessory.context.homeId = device.homeId;
+    accessory.context.kind = mapping.kind;
+    accessory.context.category = device.categoryResolved;
+    accessory.context.mapping = mapping;
+
+    this.accessories.set(uuid, accessory);
+    this.accessoryHandlers.set(uuid, new SmartLifePlatformAccessory(this, accessory, device, mapping));
+
+    const hapAccessory = (accessory as unknown as {
+      _associatedHAPAccessory?: { bridge?: unknown };
+    })._associatedHAPAccessory;
+    this.debug('Registering accessory candidate: %s (%s) bridgePresent=%s', device.name, device.devId, Boolean(hapAccessory?.bridge));
+
+    if (!hapAccessory?.bridge) {
+      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    } else {
+      this.debug('Accessory already bridged before registration, skipping duplicate register: %s (%s)', device.name, device.devId);
+    }
+
+    this.info('Added accessory: %s (%s)', device.name, device.devId);
+  }
+
+  private removeAccessory(accessory: PlatformAccessory<SmartLifeAccessoryContext>) {
+    this.info('Removing accessory: %s', accessory.displayName);
+    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    this.accessories.delete(accessory.UUID);
+    this.accessoryHandlers.delete(accessory.UUID);
+
+    const deviceId = accessory.context.deviceId;
+    if (deviceId) {
+      this.deviceById.delete(deviceId);
+    }
+  }
+
+  private async refreshDeviceDp(deviceId: string): Promise<void> {
+    if (!this.client) {
+      return;
+    }
+
+    try {
+      const latest = await this.client.getDeviceDp(deviceId);
+      const current = this.deviceById.get(deviceId);
+      if (!current) {
+        return;
+      }
+
+      current.dpsResolved = latest;
+      const uuid = this.api.hap.uuid.generate(deviceId);
+      this.accessoryHandlers.get(uuid)?.refresh();
+    } catch (error) {
+      this.debug('Device DP refresh failed devId=%s: %s', deviceId, toErrorMessage(error));
+    }
+  }
+
+  private markUnsupportedCategory(category: string) {
+    if (this.unsupportedCategories.has(category)) {
+      return;
+    }
+
+    this.unsupportedCategories.add(category);
+    this.warn('Skipping unsupported SmartLife category for HomeKit exposure: %s', category);
+  }
+
+  private info(message: string, ...parameters: unknown[]) {
+    this.log.info(message, ...parameters);
+  }
+
+  private warn(message: string, ...parameters: unknown[]) {
+    this.log.warn(message, ...parameters);
+  }
+
+  private error(message: string, ...parameters: unknown[]) {
+    this.log.error(message, ...parameters);
+  }
+
+  private debug(message: string, ...parameters: unknown[]) {
+    if (this.logLevel === 'debug' || this.logLevel === 'trace') {
+      this.log.debug(message, ...parameters);
+    }
+  }
+
+  private trace(message: string, ...parameters: unknown[]) {
+    if (this.logLevel === 'trace') {
+      this.log.debug(message, ...parameters);
     }
   }
 }

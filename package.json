@@ -1,27 +1,22 @@
 {
-  "name": "homebridge-plugin-name",
-  "displayName": "Plugin Name",
+  "name": "homebridge-smartlife-cloud",
+  "displayName": "SmartLife Cloud",
   "type": "module",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "private": true,
-  "description": "A short description about what your plugin does.",
-  "author": "Your Name",
+  "description": "Homebridge platform plugin that controls SmartLife devices through SmartLife cloud.",
+  "author": "Marcel",
   "license": "Apache-2.0",
-  "homepage": "https://github.com/USERNAME/GITHUB_PROJECT_NAME#readme",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/USERNAME/GITHUB_PROJECT_NAME.git"
-  },
-  "bugs": {
-    "url": "https://github.com/USERNAME/GITHUB_PROJECT_NAME/issues"
-  },
   "keywords": [
-    "homebridge-plugin"
+    "homebridge-plugin",
+    "smartlife",
+    "tuya",
+    "cloud"
   ],
   "main": "dist/index.js",
   "engines": {
     "node": "^20.18.0 || ^22.10.0 || ^24.0.0",
-    "homebridge": "^1.8.0 || ^2.0.0-beta.0"
+    "homebridge": "^1.8.0"
   },
   "scripts": {
     "build": "rimraf ./dist && tsc",
@@ -29,14 +24,11 @@
     "prepublishOnly": "npm run lint && npm run build",
     "watch": "npm run build && npm link && nodemon"
   },
-  "dependencies": {
-    "homebridge-lib": "^7.1.12"
-  },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
     "@types/node": "^24.10.1",
     "eslint": "^9.39.1",
-    "homebridge": "^2.0.0-beta.55",
+    "homebridge": "^1.11.2",
     "nodemon": "^3.1.11",
     "rimraf": "^6.1.0",
     "ts-node": "^10.9.2",

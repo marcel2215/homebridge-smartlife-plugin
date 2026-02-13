@@ -1,17 +1,82 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "SmartLifeCloud",
   "pluginType": "platform",
   "singular": true,
   "strictValidation": false,
   "schema": {
     "type": "object",
-    "required": ["name"],
+    "required": ["name", "email", "password"],
     "additionalProperties": false,
     "properties": {
       "name": {
         "title": "Name",
         "type": "string",
-        "default": "Example Dynamic Platform"
+        "default": "SmartLife Cloud"
+      },
+      "email": {
+        "title": "SmartLife Email",
+        "type": "string"
+      },
+      "password": {
+        "title": "SmartLife Password",
+        "type": "string"
+      },
+      "countryCode": {
+        "title": "Country Code",
+        "description": "Numeric country code used for account login.",
+        "type": "string",
+        "default": "1",
+        "pattern": "^[0-9]+$"
+      },
+      "region": {
+        "title": "Region",
+        "description": "Preferred SmartLife cloud region. Auto tries US, EU, IN.",
+        "type": "string",
+        "oneOf": [
+          { "title": "Auto", "enum": ["auto"] },
+          { "title": "US", "enum": ["us"] },
+          { "title": "EU", "enum": ["eu"] },
+          { "title": "IN", "enum": ["in"] }
+        ],
+        "default": "auto"
+      },
+      "pollIntervalSeconds": {
+        "title": "State Poll Interval (seconds)",
+        "type": "integer",
+        "default": 5,
+        "minimum": 2,
+        "maximum": 60
+      },
+      "discoveryIntervalSeconds": {
+        "title": "Discovery Refresh Interval (seconds)",
+        "type": "integer",
+        "default": 300,
+        "minimum": 30,
+        "maximum": 3600
+      },
+      "requestTimeoutMs": {
+        "title": "Request Timeout (ms)",
+        "type": "integer",
+        "default": 10000,
+        "minimum": 3000,
+        "maximum": 60000
+      },
+      "maxRetries": {
+        "title": "Max Retry Attempts",
+        "type": "integer",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 10
+      },
+      "logLevel": {
+        "title": "Log Level",
+        "type": "string",
+        "oneOf": [
+          { "title": "Info", "enum": ["info"] },
+          { "title": "Debug", "enum": ["debug"] },
+          { "title": "Trace", "enum": ["trace"] }
+        ],
+        "default": "info"
       }
     }
   }

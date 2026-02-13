@@ -1,148 +1,201 @@
 import type { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
 
-import type { ExampleHomebridgePlatform } from './platform.js';
+import type { AccessoryKind, DeviceControlMapping } from './deviceMapping.js';
+import {
+  parseContactDetected,
+  parseLeakDetected,
+  parseMotionDetected,
+  parseSmokeDetected,
+  parseSwitchState,
+} from './deviceMapping.js';
+import type { SmartLifeResolvedDevice } from './smartlife/types.js';
+import type { SmartLifePlatform } from './platform.js';
 
-/**
- * Platform Accessory
- * An instance of this class is created for each accessory your platform registers
- * Each accessory may expose multiple services of different service types.
- */
-export class ExamplePlatformAccessory {
+export interface SmartLifeAccessoryContext {
+  deviceId?: string;
+  homeId?: number;
+  category?: string;
+  kind?: AccessoryKind;
+  mapping?: DeviceControlMapping;
+}
+
+function sanitizeHomeKitName(name: string): string {
+  const cleaned = name
+    .replace(/[^A-Za-z0-9 ']/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cleaned.length > 0 ? cleaned : 'SmartLife Device';
+}
+
+export class SmartLifePlatformAccessory {
   private service: Service;
 
-  /**
-   * These are just used to create a working example
-   * You should implement your own code to track the state of your accessory
-   */
-  private exampleStates = {
-    On: false,
-    Brightness: 100,
-  };
-
   constructor(
-    private readonly platform: ExampleHomebridgePlatform,
-    private readonly accessory: PlatformAccessory,
+    private readonly platform: SmartLifePlatform,
+    private readonly accessory: PlatformAccessory<SmartLifeAccessoryContext>,
+    private device: SmartLifeResolvedDevice,
+    private mapping: DeviceControlMapping,
   ) {
-    // set accessory information
-    this.accessory.getService(this.platform.Service.AccessoryInformation)!
-      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Default-Manufacturer')
-      .setCharacteristic(this.platform.Characteristic.Model, 'Default-Model')
-      .setCharacteristic(this.platform.Characteristic.SerialNumber, 'Default-Serial');
+    this.service = this.initService();
+    this.configureAccessoryInformation();
+    this.configureHandlers();
+    this.refresh();
+  }
 
-    // get the LightBulb service if it exists, otherwise create a new LightBulb service
-    // you can create multiple services for each accessory
+  public update(device: SmartLifeResolvedDevice, mapping: DeviceControlMapping) {
+    this.device = device;
+    this.mapping = mapping;
+    this.accessory.context.homeId = device.homeId;
+    this.accessory.context.category = device.categoryResolved;
+    this.accessory.context.kind = mapping.kind;
+    this.accessory.context.mapping = mapping;
+    this.accessory.displayName = device.name;
+    this.configureAccessoryInformation();
+    this.refresh();
+  }
 
-    if (accessory.context.device.CustomService) {
-      // This is only required when using Custom Services and Characteristics not support by HomeKit
-      this.service = this.accessory.getService(this.platform.CustomServices[accessory.context.device.CustomService]) ||
-        this.accessory.addService(this.platform.CustomServices[accessory.context.device.CustomService]);
-    } else {
-      this.service = this.accessory.getService(this.platform.Service.Lightbulb) || this.accessory.addService(this.platform.Service.Lightbulb);
+  public refresh() {
+    switch (this.mapping.kind) {
+    case 'switch':
+    case 'outlet': {
+      const current = parseSwitchState(this.dpValue(this.mapping.switchDpId));
+      this.service.updateCharacteristic(this.platform.Characteristic.On, current);
+      if (this.mapping.kind === 'outlet') {
+        this.service.updateCharacteristic(this.platform.Characteristic.OutletInUse, current);
+      }
+      break;
+    }
+    case 'valve': {
+      const current = parseSwitchState(this.dpValue(this.mapping.switchDpId));
+      this.service.updateCharacteristic(this.platform.Characteristic.Active,
+        current ? this.platform.Characteristic.Active.ACTIVE : this.platform.Characteristic.Active.INACTIVE);
+      this.service.updateCharacteristic(this.platform.Characteristic.InUse, current ? 1 : 0);
+      break;
+    }
+    case 'contact': {
+      const isOpen = parseContactDetected(this.dpValue(this.mapping.contactDpId), this.mapping.contactDpId ?? '');
+      this.service.updateCharacteristic(this.platform.Characteristic.ContactSensorState,
+        isOpen
+          ? this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED
+          : this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED);
+      break;
+    }
+    case 'leak': {
+      const detected = parseLeakDetected(this.dpValue(this.mapping.leakDpId));
+      this.service.updateCharacteristic(this.platform.Characteristic.LeakDetected,
+        detected
+          ? this.platform.Characteristic.LeakDetected.LEAK_DETECTED
+          : this.platform.Characteristic.LeakDetected.LEAK_NOT_DETECTED);
+      break;
+    }
+    case 'smoke': {
+      const detected = parseSmokeDetected(this.dpValue(this.mapping.smokeDpId));
+      this.service.updateCharacteristic(this.platform.Characteristic.SmokeDetected,
+        detected
+          ? this.platform.Characteristic.SmokeDetected.SMOKE_DETECTED
+          : this.platform.Characteristic.SmokeDetected.SMOKE_NOT_DETECTED);
+      break;
+    }
+    case 'motion': {
+      const detected = parseMotionDetected(this.dpValue(this.mapping.motionDpId));
+      this.service.updateCharacteristic(this.platform.Characteristic.MotionDetected, detected);
+      break;
+    }
     }
 
-    // set the service name, this is what is displayed as the default name on the Home app
-    // in this example we are using the name we stored in the `accessory.context` in the `discoverDevices` method.
-    this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.exampleDisplayName);
-
-    // each service must implement at-minimum the "required characteristics" for the given service type
-    // see https://developers.homebridge.io/#/service/Lightbulb
-
-    // register handlers for the On/Off Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.On)
-      .onSet(this.setOn.bind(this)) // SET - bind to the `setOn` method below
-      .onGet(this.getOn.bind(this)); // GET - bind to the `getOn` method below
-
-    // register handlers for the Brightness Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.Brightness)
-      .onSet(this.setBrightness.bind(this)); // SET - bind to the `setBrightness` method below
-
-    /**
-     * Creating multiple services of the same type.
-     *
-     * To avoid "Cannot add a Service with the same UUID another Service without also defining a unique 'subtype' property." error,
-     * when creating multiple services of the same type, you need to use the following syntax to specify a name and subtype id:
-     * this.accessory.getService('NAME') || this.accessory.addService(this.platform.Service.Lightbulb, 'NAME', 'USER_DEFINED_SUBTYPE_ID');
-     *
-     * The USER_DEFINED_SUBTYPE must be unique to the platform accessory (if you platform exposes multiple accessories, each accessory
-     * can use the same subtype id.)
-     */
-
-    // Example: add two "motion sensor" services to the accessory
-    const motionSensorOneService = this.accessory.getService('Motion Sensor One Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor One Name', 'YourUniqueIdentifier-1');
-
-    const motionSensorTwoService = this.accessory.getService('Motion Sensor Two Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor Two Name', 'YourUniqueIdentifier-2');
-
-    /**
-     * Updating characteristics values asynchronously.
-     *
-     * Example showing how to update the state of a Characteristic asynchronously instead
-     * of using the `on('get')` handlers.
-     * Here we change update the motion sensor trigger states on and off every 10 seconds
-     * the `updateCharacteristic` method.
-     *
-     */
-    let motionDetected = false;
-    setInterval(() => {
-      // EXAMPLE - inverse the trigger
-      motionDetected = !motionDetected;
-
-      // push the new value to HomeKit
-      motionSensorOneService.updateCharacteristic(this.platform.Characteristic.MotionDetected, motionDetected);
-      motionSensorTwoService.updateCharacteristic(this.platform.Characteristic.MotionDetected, !motionDetected);
-
-      this.platform.log.debug('Triggering motionSensorOneService:', motionDetected);
-      this.platform.log.debug('Triggering motionSensorTwoService:', !motionDetected);
-    }, 10000);
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, turning on a Light bulb.
-   */
-  async setOn(value: CharacteristicValue) {
-    // implement your own code to turn your device on/off
-    this.exampleStates.On = value as boolean;
-
-    this.platform.log.debug('Set Characteristic On ->', value);
+  private configureAccessoryInformation() {
+    const safeName = sanitizeHomeKitName(this.device.name);
+    this.accessory.getService(this.platform.Service.AccessoryInformation)!
+      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Volcano Technology Limited')
+      .setCharacteristic(this.platform.Characteristic.Model, this.device.categoryResolved)
+      .setCharacteristic(this.platform.Characteristic.SerialNumber, this.device.devId)
+      .setCharacteristic(this.platform.Characteristic.Name, safeName);
   }
 
-  /**
-   * Handle the "GET" requests from HomeKit
-   * These are sent when HomeKit wants to know the current state of the accessory, for example, checking if a Light bulb is on.
-   *
-   * GET requests should return as fast as possible. A long delay here will result in
-   * HomeKit being unresponsive and a bad user experience in general.
-   *
-   * If your device takes time to respond you should update the status of your device
-   * asynchronously instead using the `updateCharacteristic` method instead.
-   * In this case, you may decide not to implement `onGet` handlers, which may speed up
-   * the responsiveness of your device in the Home app.
+  private initService(): Service {
+    const byKind = this.mapping.kind;
+    const serviceName = sanitizeHomeKitName(this.device.name);
+    const existing = this.accessory.services
+      .filter((service) => service.UUID !== this.platform.Service.AccessoryInformation.UUID);
 
-   * @example
-   * this.service.updateCharacteristic(this.platform.Characteristic.On, true)
-   */
-  async getOn(): Promise<CharacteristicValue> {
-    // implement your own code to check if the device is on
-    const isOn = this.exampleStates.On;
+    for (const service of existing) {
+      this.accessory.removeService(service);
+    }
 
-    this.platform.log.debug('Get Characteristic On ->', isOn);
-
-    // if you need to return an error to show the device as "Not Responding" in the Home app:
-    // throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-
-    return isOn;
+    switch (byKind) {
+    case 'switch':
+      return this.accessory.addService(this.platform.Service.Switch, serviceName);
+    case 'outlet':
+      return this.accessory.addService(this.platform.Service.Outlet, serviceName);
+    case 'valve':
+      return this.accessory.addService(this.platform.Service.Valve, serviceName);
+    case 'contact':
+      return this.accessory.addService(this.platform.Service.ContactSensor, serviceName);
+    case 'leak':
+      return this.accessory.addService(this.platform.Service.LeakSensor, serviceName);
+    case 'smoke':
+      return this.accessory.addService(this.platform.Service.SmokeSensor, serviceName);
+    case 'motion':
+      return this.accessory.addService(this.platform.Service.MotionSensor, serviceName);
+    }
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, changing the Brightness
-   */
-  async setBrightness(value: CharacteristicValue) {
-    // implement your own code to set the brightness
-    this.exampleStates.Brightness = value as number;
+  private configureHandlers() {
+    if (this.mapping.kind === 'switch' || this.mapping.kind === 'outlet') {
+      this.service.getCharacteristic(this.platform.Characteristic.On)
+        .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)))
+        .onSet(async (value) => this.setSwitch(value));
+    }
 
-    this.platform.log.debug('Set Characteristic Brightness -> ', value);
+    if (this.mapping.kind === 'outlet') {
+      this.service.getCharacteristic(this.platform.Characteristic.OutletInUse)
+        .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)));
+    }
+
+    if (this.mapping.kind === 'valve') {
+      this.service.setCharacteristic(this.platform.Characteristic.ValveType, this.platform.Characteristic.ValveType.IRRIGATION);
+
+      this.service.getCharacteristic(this.platform.Characteristic.Active)
+        .onGet(async () => {
+          const on = parseSwitchState(this.dpValue(this.mapping.switchDpId));
+          return on ? this.platform.Characteristic.Active.ACTIVE : this.platform.Characteristic.Active.INACTIVE;
+        })
+        .onSet(async (value) => {
+          const active = (value as number) === this.platform.Characteristic.Active.ACTIVE;
+          await this.setSwitch(active);
+        });
+
+      this.service.getCharacteristic(this.platform.Characteristic.InUse)
+        .onGet(async () => parseSwitchState(this.dpValue(this.mapping.switchDpId)) ? 1 : 0);
+    }
+  }
+
+  private async setSwitch(value: CharacteristicValue | boolean): Promise<void> {
+    const dpId = this.mapping.switchDpId;
+    if (!dpId) {
+      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+
+    const target = typeof value === 'boolean' ? value : Boolean(value);
+
+    try {
+      await this.platform.sendDpCommand(this.device.devId, dpId, target);
+    } catch {
+      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+
+    this.device.dpsResolved[dpId] = target;
+    this.refresh();
+  }
+
+  private dpValue(dpId: string | undefined): unknown {
+    if (!dpId) {
+      return undefined;
+    }
+
+    return this.device.dpsResolved[dpId];
   }
 }

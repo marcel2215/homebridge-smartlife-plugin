@@ -1,30 +1,25 @@
 {
   "bridge": {
-    "name": "PluginTemplate",
+    "name": "SmartLife Test Bridge",
     "username": "AA:BB:CC:DD:EE:FF",
     "port": 51826,
     "pin": "031-45-154"
   },
-  "description": "HomeBridge HTTP Status Control",
-  "plugins": [
-    "homebridge-plugin-name",
-    "homebridge-config-ui-x"
-  ],
+  "description": "SmartLife cloud plugin test config",
+  "plugins": ["homebridge-smartlife-cloud"],
   "platforms": [
     {
-      "name": "Config",
-      "port": 8581,
-      "auth": "none",
-      "theme": "auto",
-      "tempUnits": "c",
-      "lang": "auto",
-      "sudo": false,
-      "platform": "config",
-      "debug": false
-    },
-    {
-      "name": "homebridge-plugin-name",
-      "platform": "ExampleHomebridgePlugin"
+      "name": "SmartLife Cloud",
+      "platform": "SmartLifeCloud",
+      "email": "you@example.com",
+      "password": "your-password",
+      "countryCode": "1",
+      "region": "auto",
+      "pollIntervalSeconds": 5,
+      "discoveryIntervalSeconds": 300,
+      "requestTimeoutMs": 10000,
+      "maxRetries": 3,
+      "logLevel": "info"
     }
   ],
   "accessories": []
