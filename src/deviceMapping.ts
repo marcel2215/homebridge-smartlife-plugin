@@ -9,6 +9,7 @@ export type AccessoryKind = 'switch' | 'outlet' | 'valve' | 'contact' | 'leak' |
 export interface DeviceControlMapping {
   kind: AccessoryKind;
   switchDpId?: string;
+  countdownDpId?: string;
   contactDpId?: string;
   leakDpId?: string;
   smokeDpId?: string;
@@ -24,6 +25,7 @@ const SMOKE_CATEGORIES = new Set(['ywbj']);
 const MOTION_CATEGORIES = new Set(['pir', 'hps']);
 
 const SWITCH_CODES = ['switch', 'switch_1', 'switch_led', 'start', 'status'];
+const COUNTDOWN_CODES = ['countdown', 'countdown_1'];
 const CONTACT_CODES = ['doorcontact_state', 'door_open_state', 'contact_state'];
 const LEAK_CODES = ['watersensor_state', 'gas_sensor_state', 'ch4_sensor_state', 'water_state', 'leak_state'];
 const SMOKE_CODES = ['smoke_sensor_state', 'smoke_state', 'smoke'];
@@ -141,6 +143,7 @@ function findDpId(device: SmartLifeResolvedDevice, codes: string[], allowBoolean
 
 export function classifyAndMapDevice(device: SmartLifeResolvedDevice): DeviceControlMapping | undefined {
   const switchDpId = findDpId(device, SWITCH_CODES, true);
+  const countdownDpId = findDpId(device, COUNTDOWN_CODES, false);
   const contactDpId = findDpId(device, CONTACT_CODES, false);
   const leakDpId = findDpId(device, LEAK_CODES, false);
   const smokeDpId = findDpId(device, SMOKE_CODES, false);
@@ -155,13 +158,13 @@ export function classifyAndMapDevice(device: SmartLifeResolvedDevice): DeviceCon
   if (OUTLET_CATEGORIES.has(category)) {
     const normalizedName = device.name.toLowerCase();
     if (VALVE_NAME_HINTS.some((hint) => normalizedName.includes(hint))) {
-      return switchDpId ? { kind: 'valve', switchDpId } : undefined;
+      return switchDpId ? { kind: 'valve', switchDpId, countdownDpId } : undefined;
     }
     return switchDpId ? { kind: 'outlet', switchDpId } : undefined;
   }
 
   if (VALVE_CATEGORIES.has(category)) {
-    return switchDpId ? { kind: 'valve', switchDpId } : undefined;
+    return switchDpId ? { kind: 'valve', switchDpId, countdownDpId } : undefined;
   }
 
   if (CONTACT_CATEGORIES.has(category)) {
